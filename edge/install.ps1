@@ -53,6 +53,12 @@ $LogDir     = Get-EnvOrDefault "LOG_DIR"     "$RootDir\logs"
 # match server.DefaultUpdateStagingDir in
 # internal/server/constant_windows.go ($RootDir\update).
 $UpdateDir = Get-EnvOrDefault "UPDATE_DIR" "$RootDir\update"
+# DataDir is the dataplane (Vector) worker's persistent state directory
+# (disk buffers, source checkpoints, validate_tmp). Must match
+# server.DefaultWorkerDataDir in internal/server/constant_windows.go
+# ($RootDir\data). Not created lazily by the worker -- must exist before
+# validate/start or the worker fails with "data_dir ... does not exist".
+$DataDir = Get-EnvOrDefault "WORKER_DATA_DIR" "$RootDir\data"
 $TmpDir     = Get-EnvOrDefault "TMP_DIR"     "$env:TEMP\observo"
 $ZipFile    = "$TmpDir\edge.zip"
 $ExtractDir = "$TmpDir\binaries_edge"
@@ -339,7 +345,8 @@ function Move-BinariesToInstallDir {
     #   $RootDir\           binaries + edge-config.json + effective.yaml
     #   $RootDir\logs\      supervisor + worker + update-watcher logs
     #   $RootDir\update\    staging dir + heartbeat (if used) + flag file
-    foreach ($d in @($RootDir, $LogDir, $UpdateDir)) {
+    #   $RootDir\data\      dataplane (Vector) worker persistent state
+    foreach ($d in @($RootDir, $LogDir, $UpdateDir, $DataDir)) {
         if (-not (Test-Path -Path $d)) {
             New-Item -ItemType Directory -Path $d -Force | Out-Null
             Write-Host "Created directory: $d"
@@ -485,6 +492,7 @@ set WATCHER_EXECUTABLE=$WatcherExecutable
 set WORKER_EXECUTABLE_PATH=$WorkerExecutablePath
 set WORKER_CONFIG_PATH=$WorkerConfigPath
 set WORKER_LOG_FILE_PATH=$WorkerLogFilePath
+set WORKER_DATA_DIR=$DataDir
 echo Starting Observo Edge Agent at %DATE% %TIME% > "$StdoutLogFile"
     "$EdgeExe" -config "$ConfigFile" >> "$StdoutLogFile" 2>&1
 "@
