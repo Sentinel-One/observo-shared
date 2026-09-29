@@ -3029,6 +3029,22 @@ function Set-ObservoAcls {
         Invoke-IcaclsChecked @($ConfigFile, "/inheritance:r", "/grant:r", "SYSTEM:F", "BUILTIN\Administrators:F", "${AccountName}:M")
     }
 
+    # effective.yaml: the supervisor computes and writes this itself the
+    # first time it applies a config, AFTER this function has already run
+    # once (it does not exist at install time the way edge-config.json
+    # does). Creating a FILE requires write access to its PARENT directory
+    # -- $RootDir only grants the service account read+execute -- so
+    # without this, the first write fails with "Access is denied" (caught
+    # via live e2e testing: a fresh install has no old, more permissive
+    # effective.yaml lying around to paper over the gap). Pre-create an
+    # empty placeholder now, while we still have the standing to do so,
+    # then grant Modify on it directly -- the same pattern already used
+    # for edge-config.json above.
+    if (-not (Test-Path -Path $WorkerConfigPath)) {
+        New-Item -ItemType File -Path $WorkerConfigPath -Force | Out-Null
+    }
+    Invoke-IcaclsChecked @($WorkerConfigPath, "/inheritance:r", "/grant:r", "SYSTEM:F", "BUILTIN\Administrators:F", "${AccountName}:M")
+
     # run_observo.cmd carries AUTH_TOKEN in plaintext; the service account
     # only ever executes it, never writes to it.
     $wrapperPath = "$InstallDir\run_observo.cmd"
