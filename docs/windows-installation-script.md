@@ -2,7 +2,7 @@
 
 ## Overview
 
-This PowerShell script automates the installation and configuration of the Observo Edge agent on Windows systems. It sets up the agent to run as a scheduled task with system privileges and provides comprehensive logging capabilities.
+This PowerShell script automates the installation and configuration of the Observo Edge agent on Windows systems. It registers the agent as a Windows Service (via a bundled [NSSM](http://nssm.cc) wrapper), running under a dedicated least-privilege local account by default, and provides comprehensive logging capabilities.
 
 ## System Requirements
 
@@ -23,8 +23,11 @@ This PowerShell script automates the installation and configuration of the Obser
 3. Decodes the provided token to extract agent configuration
 4. Downloads and extracts the agent binaries from a secure URL
 5. Moves binaries to the installation directory (`C:\Program Files\Observo`)
-6. Creates a scheduled task to run the agent at system startup as SYSTEM user
-7. Configures log redirection to capture all agent output
+6. Creates a dedicated least-privilege local service account (or reuses `LocalSystem` if
+   `USE_SYSTEM_ACCOUNT=true` is set) and registers the agent as a Windows Service via NSSM, running
+   under that account
+7. Hardens ACLs on the installation directory and every file that carries the auth token
+8. Configures log redirection to capture all agent output
 
 ## Installation Command
 
@@ -47,16 +50,16 @@ To verify the agent is running:
 Get-Process -Name "edge" -ErrorAction SilentlyContinue
 ```
 
-### Managing the Scheduled Task
+### Managing the Windows Service
 ```powershell
-# View task status
-Get-ScheduledTask -TaskName "ObservoEdge"
+# View service status
+Get-Service -Name "observo-edge"
 
 # Stop the agent
-Stop-ScheduledTask -TaskName "ObservoEdge"
+Stop-Service -Name "observo-edge"
 
 # Start the agent
-Start-ScheduledTask -TaskName "ObservoEdge"
+Start-Service -Name "observo-edge"
 ```
 
 ### Process Management
@@ -72,18 +75,27 @@ Get-Process -Name "edge" | Select-Object Id
 
 - **Installation Directory**: `C:\Program Files\Observo`
 - **Configuration File**: `C:\Program Files\Observo\edge-config.json`
-- **Historical Configs**: `C:\Program Files\Observo\history\`
-- **Scheduled Task**: "ObservoEdge" (visible in Task Scheduler)
+- **Historical Configs**: `C:\Program Files\Observo\history\` (retained: last 10 by default)
+- **Service Wrapper**: `C:\Program Files\Observo\nssm.exe` (bundled, public domain)
+- **Windows Service**: `observo-edge` (visible via `Get-Service`)
+- **Service Account**: `svc-observo-edge` (local, least-privilege, non-interactive)
 
 ## Troubleshooting
 
 - Check the log file for detailed error messages
-- Verify the scheduled task is running with "Ready" status
+- Verify the service is running: `Get-Service -Name "observo-edge"` should show `Running`
 - Confirm the system has network connectivity to the Observo backend
 - Verify the agent has appropriate permissions to access required resources
 
 ## Security Considerations
 
-- The agent runs with SYSTEM privileges to ensure proper functionality
-- All configuration data is stored securely in the Program Files directory
-- The agent communicates with the Observo backend using secure authentication tokens
+- The agent runs under a dedicated local service account (`svc-observo-edge`) with no interactive
+  logon rights, scoped to Event Log Readers membership, instead of `NT AUTHORITY\SYSTEM`. Set
+  `USE_SYSTEM_ACCOUNT=true` at install time to opt back into running as `LocalSystem` if required.
+- The installation directory and every file that carries the auth token (`edge-config.json`, its
+  historical copies, and `run_observo.cmd`) have explicit, non-inherited ACLs limiting access to
+  `SYSTEM`, `Administrators`, and the service account.
+- The auth token is never written to console/transcript output during install.
+- The `history\` directory is pruned to the 10 most recent configs on every install/reinstall.
+- All configuration data is stored securely in the Program Files directory.
+- The agent communicates with the Observo backend using secure authentication tokens.

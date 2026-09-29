@@ -17,16 +17,29 @@ param (
 #   New-only dir:        $InstallDir\update
 # All removals are best-effort: missing resources are logged and skipped
 # (not fatal), since old- and new-layout artifacts rarely coexist.
-$InstallDir  = "C:\Program Files\Observo"
+#
+# $InstallDir mirrors install.ps1's Get-EnvOrDefault(ROOT_DIR/INSTALL_DIR)
+# resolution -- previously hardcoded here, which silently broke uninstall
+# for any install done with a custom ROOT_DIR/INSTALL_DIR (OBE-12500).
+function Get-EnvOrDefault {
+    param([string]$Name, [string]$Default)
+    $val = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrEmpty($val)) { return $Default }
+    return $val
+}
+$InstallDir  = Get-EnvOrDefault "ROOT_DIR" (Get-EnvOrDefault "INSTALL_DIR" "C:\Program Files\Observo")
 $ConfigFile  = "$InstallDir\edge-config.json"
 $HistoryDir  = "$InstallDir\history"
 $LogDir      = "$InstallDir\logs"
 $UpdateDir   = "$InstallDir\update"
 $WrapperPath = "$InstallDir\run_observo.cmd"
+$NssmPath    = "$InstallDir\nssm.exe"
 # Both the current task name and the legacy one are cleaned up.
 $ServiceNames  = @("observo-edge", "ObservoEdge")
 # Process names covering old (otelcontribcol) and new (edge-watcher/worker) layouts.
 $ProcessNames  = @("edge", "edge-watcher", "edge-worker", "otelcontribcol")
+# Least-privilege local service account created by install.ps1 (OBE-12500 AC3).
+$ServiceAccountName = Get-EnvOrDefault "SERVICE_ACCOUNT_NAME" "svc-observo-edge"
 
 function Stop-ObservoTask {
     foreach ($name in $ServiceNames) {
@@ -43,15 +56,37 @@ function Stop-ObservoTask {
             }
         }
 
-        # The old installer could also register a Windows service of the same
-        # name; remove it too if present.
+        # Any registered Windows service of this name: the current
+        # installer registers one via NSSM, and the old installer(s)
+        # could also register one directly. `nssm remove` cleans up
+        # NSSM's own registry keys more reliably than a raw
+        # `sc.exe delete` against an NSSM-wrapped service, so prefer it
+        # when nssm.exe is present.
         $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
         if ($svc) {
             Write-Host "Stopping and removing Windows service: $name..."
             Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 2
-            sc.exe delete $name | Out-Null
+            if (Test-Path -Path $NssmPath) {
+                & $NssmPath remove $name confirm | Out-Null
+            } else {
+                sc.exe delete $name | Out-Null
+            }
         }
+    }
+}
+
+function Remove-ObservoServiceAccount {
+    $account = Get-LocalUser -Name $ServiceAccountName -ErrorAction SilentlyContinue
+    if (-not $account) {
+        Write-Host "Service account $ServiceAccountName not found, skipping."
+        return
+    }
+    Write-Host "Removing service account: $ServiceAccountName..."
+    try {
+        Remove-LocalUser -Name $ServiceAccountName -ErrorAction Stop
+    } catch {
+        Write-Host "Warning: failed to remove service account '$ServiceAccountName': $_" -ForegroundColor Yellow
     }
 }
 
@@ -188,11 +223,14 @@ function Remove-InstallDir {
 
 Write-Host "Uninstalling Observo Edge..."
 
-# Step 1: Stop and unregister scheduled task
+# Step 1: Stop and unregister scheduled task / service
 Stop-ObservoTask
 
 # Step 2: Kill any remaining processes
 Stop-ObservoProcesses
+
+# Step 2b: Remove the least-privilege service account (OBE-12500)
+Remove-ObservoServiceAccount
 
 # Step 3: Remove wrapper script
 Remove-WrapperScript
