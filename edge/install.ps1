@@ -76,7 +76,7 @@ $EdgeConfigPath       = Get-EnvOrDefault "EDGE_CONFIG_PATH"       "$RootDir\edge
 $ConfigFile   = $EdgeConfigPath
 $ServiceName  = Get-EnvOrDefault "SERVICE_NAME" "observo-edge"
 
-# Least-privilege identity for the Windows Service (OBE-12500 AC3). By
+# Least-privilege identity for the Windows Service. By
 # default the installer creates a dedicated local service account with no
 # interactive logon rights, scoped to "Log on as a service" + Event Log
 # Readers. Set USE_SYSTEM_ACCOUNT=true to opt back into running as
@@ -149,9 +149,9 @@ function Parse-EnvironmentVariable {
     }
 
     # SECURITY: $EnvVar carries install_id=<base64-encoded-secret-JSON> and
-    # must never be logged verbatim (OBE-12500 AC1) -- it, and its decoded
-    # form, contain auth_token in the clear. Redact install_id before it
-    # ever reaches Write-Host/transcript output.
+    # must never be logged verbatim -- it, and its decoded form, contain
+    # auth_token in the clear. Redact install_id before it ever reaches
+    # Write-Host/transcript output.
     Write-Host "Received environment variable: $($EnvVar -replace 'install_id=[A-Za-z0-9+/=]+', 'install_id=***redacted***')"
 
     # Parse install_id
@@ -281,9 +281,9 @@ function Decode-AndExtractConfig {
     Write-Host "Configuration saved to $ConfigFile"
     Write-Host "Historical copy saved to $HistoricalConfigFile"
 
-    # OBE-12500 AC5: history/ previously grew unbounded across reinstalls
-    # (every install run wrote a new timestamped copy of the secret-bearing
-    # config, nothing ever pruned it). Cap it at the most recent N copies.
+    # history/ previously grew unbounded across reinstalls (every install
+    # run wrote a new timestamped copy of the secret-bearing config,
+    # nothing ever pruned it). Cap it at the most recent N copies.
     Prune-ConfigHistory -HistoryDir $HistoryDir -KeepCount 10
 }
 
@@ -482,11 +482,8 @@ function Move-BinariesToInstallDir {
 # NSSM (Non-Sucking Service Manager) -- vendored service wrapper.
 #
 # edge.exe has no native Windows Service Control Manager support (no
-# ServiceMain handler -- see the Windows Scheduled Task section of
-# pipeline/edge/internal/updatemanager/servicemanager.go for the Go-side
-# rationale). NSSM (public domain, http://nssm.cc) wraps it as a real,
-# SCM-visible service (OBE-12500 AC2) the same way Cribl Edge wraps
-# cribl.exe.
+# ServiceMain handler). NSSM (public domain, http://nssm.cc) wraps it as
+# a real, SCM-visible service instead.
 #
 # Only THIS FILE is ever fetched by end users (fleet-manager's installer
 # bootstrap does `Invoke-WebRequest .../edge/install.ps1`, nothing else in
@@ -2740,7 +2737,7 @@ function Get-NssmExecutable {
 }
 
 ####################################################################
-# Least-privilege service account (OBE-12500 AC3).
+# Least-privilege service account.
 ####################################################################
 
 # Generates a random password meeting typical local-account complexity
@@ -2947,7 +2944,7 @@ function New-ObservoServiceAccount {
 }
 
 ####################################################################
-# ACL hardening (OBE-12500 AC4).
+# ACL hardening.
 ####################################################################
 
 # Applies explicit, non-inherited ACLs to $RootDir and every file that
@@ -3050,8 +3047,8 @@ function Install-AsService {
     # even older installer version that predates Scheduled Tasks
     # entirely) or a Scheduled Task (every installer version between
     # those two). This is the upgrade path for existing customer installs
-    # (OBE-12500 AC8) -- they are all Scheduled-Task-based today and must
-    # migrate cleanly to the new Service on first run of this script.
+    # -- they are all Scheduled-Task-based today and must migrate cleanly
+    # to the new Service on first run of this script.
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Write-Host "Existing service '$ServiceName' found. Stopping and removing..."
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue

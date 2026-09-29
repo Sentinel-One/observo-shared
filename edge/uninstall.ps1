@@ -20,7 +20,7 @@ param (
 #
 # $InstallDir mirrors install.ps1's Get-EnvOrDefault(ROOT_DIR/INSTALL_DIR)
 # resolution -- previously hardcoded here, which silently broke uninstall
-# for any install done with a custom ROOT_DIR/INSTALL_DIR (OBE-12500).
+# for any install done with a custom ROOT_DIR/INSTALL_DIR.
 function Get-EnvOrDefault {
     param([string]$Name, [string]$Default)
     $val = [Environment]::GetEnvironmentVariable($Name)
@@ -38,7 +38,7 @@ $NssmPath    = "$InstallDir\nssm.exe"
 $ServiceNames  = @("observo-edge", "ObservoEdge")
 # Process names covering old (otelcontribcol) and new (edge-watcher/worker) layouts.
 $ProcessNames  = @("edge", "edge-watcher", "edge-worker", "otelcontribcol")
-# Least-privilege local service account created by install.ps1 (OBE-12500 AC3).
+# Least-privilege local service account created by install.ps1.
 $ServiceAccountName = Get-EnvOrDefault "SERVICE_ACCOUNT_NAME" "svc-observo-edge"
 
 function Stop-ObservoTask {
@@ -229,7 +229,7 @@ Stop-ObservoTask
 # Step 2: Kill any remaining processes
 Stop-ObservoProcesses
 
-# Step 2b: Remove the least-privilege service account (OBE-12500)
+# Step 2b: Remove the least-privilege service account
 Remove-ObservoServiceAccount
 
 # Step 3: Remove wrapper script
