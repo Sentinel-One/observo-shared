@@ -3006,6 +3006,34 @@ function Set-ObservoAcls {
     Invoke-IcaclsChecked @($RootDir, "/inheritance:r", "/grant:r", "SYSTEM:(OI)(CI)F", "BUILTIN\Administrators:(OI)(CI)F", "${AccountName}:(OI)(CI)RX")
     Invoke-IcaclsChecked @("$RootDir\*", "/reset", "/T", "/C", "/Q")
 
+    # Self-update needs to create edge.exe.new/edge-worker.exe.new directly
+    # in $RootDir, then rename the live binaries aside to .bak and rename
+    # the .new files into place (see pipeline/edge's
+    # internal/updatemanager/watcher.go: swapBinaries). This is a
+    # deliberately NOT (OI)(CI)-flagged ACE ("this folder only", matching
+    # the comment above about container-inheritance semantics): it grants
+    # the service account rights scoped to $RootDir's own directory
+    # entries, without changing what gets inherited by children -- the
+    # binaries stay nominally RX-only per-file, exactly as before.
+    #
+    # Basic "Modify" is NOT enough here, even though it includes
+    # create-files/write-data: deleting or renaming an EXISTING child
+    # (e.g. renaming edge.exe to edge.exe.bak, or removing a stale .new
+    # file during failure cleanup) requires the "delete subfolders and
+    # files" special permission on the parent, which only Full Control
+    # grants -- Modify's own DELETE bit covers deleting $RootDir itself,
+    # not its children. Verified live in two stages: Modify alone let
+    # extraction create edge.exe.new successfully, but the very next step
+    # (backing up the live edge.exe to edge.exe.bak) failed with "Access
+    # is denied", as did the failure-path cleanup of the otherwise-orphaned
+    # .new files. Full Control, still folder-only/non-propagating, fixes
+    # both. Without this entirely, every upgrade fails at the extract step
+    # with "Access is denied" creating edge.exe.new (first observed
+    # immediately after the NSSM/least-privilege migration, since
+    # edge-watcher.exe -- which performs the swap -- inherits the same
+    # restricted service-account identity as the rest of the service).
+    Invoke-IcaclsChecked @($RootDir, "/grant", "${AccountName}:(F)")
+
     # Directories the running agent/worker must be able to write into at
     # runtime: Vector worker persistent state, logs, in-flight update
     # staging. Without this the service starts under the new low-privilege
@@ -3053,6 +3081,68 @@ function Set-ObservoAcls {
     }
 
     Write-Host "ACLs hardened."
+}
+
+# Grants the service account the right to start/stop its OWN Windows
+# Service via the Service Control Manager. This is a SEPARATE permission
+# system from the filesystem ACLs Set-ObservoAcls manages above -- a
+# Windows Service object has its own security descriptor (viewable via
+# `sc.exe sdshow`), independent of any NTFS ACL on the service's binary or
+# install directory.
+#
+# NSSM's default service security descriptor only grants the well-known
+# "SU" (Service logon accounts) and "IU" (Interactive logon) groups
+# CCLCSWLOCRRC (query config/status, enumerate dependents, interrogate,
+# read control) -- notably missing RP (SERVICE_START) and WP
+# (SERVICE_STOP). Any account running AS a service (including our
+# restricted $ServiceAccountName) is a member of "SU", so without this
+# explicit grant, the account can never start or stop itself via the SCM.
+#
+# This was invisible at install time (Start-Service there is invoked by
+# this script, running as an Administrator) but broke self-update:
+# pipeline/edge's watcher.go restarts the service as the *running* service
+# account after swapping binaries, and that Start-Service call failed with
+# "Cannot open observo-edge service on computer '.'" -- verified live, on
+# both the forward restart and the rollback-path restart after a failed
+# update. The service recovered only because NSSM's own AppExit Default
+# Restart policy (configured below) independently restarts the process on
+# unexpected exit, completely orthogonal to the explicit Start-Service call
+# the agent makes; relying on that as the real fix would leave the agent
+# reporting a false UPDATE_STATE_FAILURE on every successful update.
+#
+# Scoped to this specific account's SID (not the whole "SU" group) to avoid
+# widening rights for any other NSSM-wrapped service that might exist on
+# the same host.
+function Grant-ServiceControlRights {
+    param([Parameter(Mandatory=$true)][string]$AccountName)
+
+    $sid = (New-Object System.Security.Principal.NTAccount($AccountName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $currentSddl = (& sc.exe sdshow $ServiceName | Where-Object { $_ -match '^D:' } | Select-Object -First 1).Trim()
+    if (-not $currentSddl) {
+        Write-Host "Warning: could not read current SDDL for service '$ServiceName' -- skipping SCM permission grant." -ForegroundColor Yellow
+        return
+    }
+    if ($currentSddl -match [regex]::Escape($sid)) {
+        Write-Host "Service '$ServiceName' SDDL already grants '$AccountName' explicit rights; skipping."
+        return
+    }
+
+    # Insert a new ACE granting this account the same baseline rights as
+    # "SU"/"IU" (CC,LC,SW,LO,CR,RC) PLUS RP (start) and WP (stop), appended
+    # before the SACL ("S:") section if present.
+    $newAce = "(A;;CCLCSWRPWPLOCRRC;;;$sid)"
+    if ($currentSddl -match '^(D:.*?)(S:.*)?$' -and $matches[2]) {
+        $newSddl = $matches[1] + $newAce + $matches[2]
+    } else {
+        $newSddl = $currentSddl + $newAce
+    }
+
+    & sc.exe sdset $ServiceName $newSddl | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Warning: sc.exe sdset exited with code $LASTEXITCODE -- '$AccountName' may not be able to start/stop '$ServiceName' (self-update would then fail at the restart step)." -ForegroundColor Yellow
+    } else {
+        Write-Host "Granted '$AccountName' start/stop rights on service '$ServiceName'."
+    }
 }
 
 function Install-AsService {
@@ -3192,6 +3282,7 @@ set WORKER_DATA_DIR=$DataDir
             Write-Host "Refusing to silently fall back to LocalSystem -- fix the account/service and re-run." -ForegroundColor Red
             exit 1
         }
+        Grant-ServiceControlRights -AccountName $ServiceAccountName
     }
 
     # ACLs must be in place BEFORE the service starts, not after: on a
