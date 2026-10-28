@@ -83,6 +83,15 @@ if [[ "$OS" == "Linux" ]]; then
             echo "Service $svc not found, skipping."
         fi
     done
+    # Update helper (non-root agent layout): path trigger, oneshot service,
+    # the agent's shim drop-in, and the root-owned helper dir.
+    sudo systemctl disable --now observo-edge-update.path 2>/dev/null || true
+    sudo systemctl stop observo-edge-update.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/observo-edge-update.path /etc/systemd/system/observo-edge-update.service
+    sudo rm -f /etc/systemd/system/observo-edge.service.d/10-update-shim.conf
+    sudo rmdir /etc/systemd/system/observo-edge.service.d 2>/dev/null || true
+    sudo rm -f /usr/local/libexec/observo/edge-watcher /usr/local/libexec/observo/systemd-run-noop
+    sudo rmdir /usr/local/libexec/observo 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || echo "Warning: failed to reload systemd daemon."
 
     # Also kill any stray processes left behind (e.g. an old nohup-launched edge).
