@@ -77,6 +77,13 @@ CONFIG_FILE="$EDGE_CONFIG_PATH"
 SERVICE_NAME="${SERVICE_NAME:-observo-edge}"
 USER="${OBSERVO_USER:-observo}"
 
+# The agent runs as the unprivileged $USER. Self-update needs root (swap
+# binaries, restart the unit), so it is done by a root-owned helper that the
+# agent can only trigger by writing update-request.json (see
+# install_update_helper). HELPER_DIR is root-owned and not writable by $USER.
+HELPER_DIR="${HELPER_DIR:-/usr/local/libexec/observo}"
+UPDATE_UNIT="${UPDATE_UNIT:-${SERVICE_NAME}-update}"
+
 # Names of the three binaries we expect to find in the release bundle.
 EDGE_BINARY_NAME="edge"
 WATCHER_BINARY_NAME="edge-watcher"
@@ -362,9 +369,9 @@ move_to_bin_and_make_executable() {
     # Belt-and-suspenders: recursively normalise the entire install
     # directory in case any sibling files (config, certs, staging
     # area) were created with different ownership.
-    # Since edge runs as root, set ownership to root:root for consistency.
-    echo "Setting ownership of $INSTALL_DIR to root:root"
-    sudo chown -R root:root "$INSTALL_DIR"
+    # The edge runs as $USER, so it owns its install tree.
+    echo "Setting ownership of $INSTALL_DIR to $USER:$USER"
+    sudo chown -R "$USER:$USER" "$INSTALL_DIR"
 
     # Ensure proper permissions for the directory and config file
     sudo chmod 755 "$INSTALL_DIR"
@@ -372,7 +379,7 @@ move_to_bin_and_make_executable() {
         sudo chmod 644 "$CONFIG_FILE"
     fi
 
-    # Sanity check: confirm each binary is owned by root and is executable.
+    # Sanity check: confirm each binary is owned by $USER and is executable.
     # Catching this here is much friendlier than the later "fork/exec ...: operation not permitted"
     # failure the supervisor would log mid-update.
     for bin in "$EDGE_EXECUTABLE" "$WATCHER_EXECUTABLE" "$WORKER_EXECUTABLE_PATH"; do
@@ -382,8 +389,8 @@ move_to_bin_and_make_executable() {
         fi
         local owner
         owner=$(stat -c '%U:%G' "$bin" 2>/dev/null || stat -f '%Su:%Sg' "$bin" 2>/dev/null)
-        if [[ "$owner" != "root:root" ]]; then
-            echo "Error: $bin has owner $owner after install (expected root:root)" >&2
+        if [[ "$owner" != "$USER:$USER" ]]; then
+            echo "Error: $bin has owner $owner after install (expected $USER:$USER)" >&2
             exit 1
         fi
     done
@@ -417,12 +424,12 @@ create_system_user() {
             if command -v useradd &>/dev/null; then
                 if ! getent group "$USER" > /dev/null; then
                     echo "Creating group '$USER'..."
-                    groupadd --system "$USER" || echo "Group creation failed"
+                    sudo groupadd --system "$USER" || echo "Group creation failed"
                 fi
 
                 if ! id "$USER" &>/dev/null; then
                     echo "Creating system user '$USER'..."
-                    useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$USER" "$USER" || echo "User creation failed"
+                    sudo useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$USER" "$USER" || echo "User creation failed"
                 fi
 
             elif command -v adduser &>/dev/null; then
@@ -431,7 +438,7 @@ create_system_user() {
                 fi
 
                 if ! id "$USER" &>/dev/null; then
-                    adduser -S -H -s /sbin/nologin -G "$USER" "$USER"
+                    sudo adduser -S -H -s /sbin/nologin -G "$USER" "$USER"
                 fi
             fi
             ;;
@@ -463,10 +470,68 @@ setup_directories() {
         fi
     done
 
-    echo "Setting ownership to root:root (edge runs as root)"
-    sudo chown root:root "$ROOT_DIR" "$LOG_DIR" "$UPDATE_DIR" "$DATA_DIR" \
+    echo "Setting ownership to $USER:$USER (edge runs as $USER)"
+    sudo chown "$USER:$USER" "$ROOT_DIR" "$LOG_DIR" "$UPDATE_DIR" "$DATA_DIR" \
         || { echo "Failed to set ownership on edge directories"; exit 1; }
     sudo chmod 0755 "$ROOT_DIR" "$LOG_DIR" "$UPDATE_DIR" "$DATA_DIR"
+}
+
+# Installs the root-owned self-update helper:
+#   - a root-owned copy of edge-watcher in $HELPER_DIR (updates never replace it)
+#   - $UPDATE_UNIT.path: fires when the agent writes update-request.json
+#   - $UPDATE_UNIT.service: root oneshot that runs the watcher, sandboxed
+#     (ProtectSystem=strict, write access to $ROOT_DIR only). It runs with
+#     Group=$USER/UMask=0007 so the heartbeat socket it creates in $UPDATE_DIR
+#     is 0770 root:$USER and the agent can dial it.
+#   - a drop-in that bind-mounts a no-op over /usr/bin/systemd-run for the
+#     agent only: a non-root agent cannot call systemd-run, and the path unit
+#     starts the update instead.
+# Only writes files; the caller reloads systemd.
+install_update_helper() {
+    echo "Installing update helper under $HELPER_DIR..."
+    sudo mkdir -p "$HELPER_DIR" || { echo "Failed to create $HELPER_DIR"; exit 1; }
+    sudo cp "$WATCHER_EXECUTABLE" "$HELPER_DIR/edge-watcher" || { echo "Failed to copy edge-watcher"; exit 1; }
+    printf '#!/bin/sh\n# The update is started by %s.path, not by the agent.\nexit 0\n' "$UPDATE_UNIT" \
+        | sudo tee "$HELPER_DIR/systemd-run-noop" > /dev/null
+    sudo chown root:root "$HELPER_DIR" "$HELPER_DIR/edge-watcher" "$HELPER_DIR/systemd-run-noop"
+    sudo chmod 0755 "$HELPER_DIR" "$HELPER_DIR/edge-watcher" "$HELPER_DIR/systemd-run-noop"
+
+    sudo tee "/etc/systemd/system/${UPDATE_UNIT}.service" > /dev/null <<EOF
+[Unit]
+Description=Observo Edge Update Helper (root, sandboxed)
+
+[Service]
+Type=oneshot
+User=root
+Group=$USER
+UMask=0007
+ExecStart=$HELPER_DIR/edge-watcher --config $UPDATE_DIR/update-request.json
+ProtectSystem=strict
+ReadWritePaths=$ROOT_DIR
+PrivateTmp=true
+NoNewPrivileges=true
+TimeoutStartSec=900
+StandardOutput=append:$LOG_DIR/update-watcher.log
+StandardError=append:$LOG_DIR/update-watcher.log
+EOF
+
+    sudo tee "/etc/systemd/system/${UPDATE_UNIT}.path" > /dev/null <<EOF
+[Unit]
+Description=Start the Observo update helper when the agent writes an update request
+
+[Path]
+PathChanged=$UPDATE_DIR/update-request.json
+Unit=${UPDATE_UNIT}.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo mkdir -p "/etc/systemd/system/${SERVICE_NAME}.service.d"
+    sudo tee "/etc/systemd/system/${SERVICE_NAME}.service.d/10-update-shim.conf" > /dev/null <<EOF
+[Service]
+BindReadOnlyPaths=$HELPER_DIR/systemd-run-noop:/usr/bin/systemd-run
+EOF
 }
 
 create_systemd_service() {
@@ -509,11 +574,10 @@ Type=simple
 ExecStart=$EDGE_EXECUTABLE
 Restart=always
 RestartSec=5
-# NOTE: edge runs as root so the update watcher (spawned by edge) inherits
-# root privileges and can call systemctl restart/stop directly without sudo.
-# Running as root also avoids permission issues with /opt/observo files.
-User=root
-Group=root
+# NOTE: edge runs unprivileged. Self-update is performed by the root helper
+# $UPDATE_UNIT.service, started by $UPDATE_UNIT.path (see install_update_helper).
+User=$USER
+Group=$USER
 WorkingDirectory=$INSTALL_DIR
 
 # NOTE: AGENT_ID is intentionally NOT set here. The edge obtains its
@@ -542,12 +606,15 @@ StandardError=append:$LOG_DIR/observo-edge.log
 [Install]
 WantedBy=multi-user.target
 EOF
+    install_update_helper
+
     echo "Reloading systemd daemon..."
     sudo systemctl daemon-reexec || echo "daemon-reexec failed"
     sudo systemctl daemon-reload || echo "daemon-reload failed"
 
     echo "Enabling and starting $SERVICE_NAME..."
     sudo systemctl enable "$SERVICE_NAME" || echo "Enable failed"
+    sudo systemctl enable --now "${UPDATE_UNIT}.path" || echo "Enabling ${UPDATE_UNIT}.path failed"
     sudo systemctl restart "$SERVICE_NAME" || echo "Restart failed"
 }
 
